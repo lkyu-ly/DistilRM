@@ -1,0 +1,40 @@
+### model
+model_name_or_path: /H1/zhouhongli/JudgePO/models/vicuna-7b-v1.5
+### method
+stage: dpo
+do_train: true
+finetuning_type: full
+pref_beta: 2.5
+simpo_gamma: 1.6
+pref_loss: simpo  # choices: [sigmoid (dpo), orpo, simpo]
+
+### dataset
+dataset_dir: train/LLaMA-Factory/data
+dataset: helpsteer_dpo
+template: vicuna
+cutoff_len: 1024
+max_samples: 1000000
+overwrite_cache: true
+
+### output
+output_dir: /H1/zhouhongli/JudgePO/LLaMA-Factory/output/vicuna-7b-v1.5-helpsteer_simpo_2.5_1.6_lr_1e-5_epoch_3
+logging_steps: 1
+save_steps: 1000
+plot_loss: true
+overwrite_output_dir: true
+
+### train
+per_device_train_batch_size: 2
+gradient_accumulation_steps: 16
+learning_rate: 1.0e-5
+num_train_epochs: 3.0
+lr_scheduler_type: cosine
+warmup_ratio: 0.1
+bf16: true
+ddp_timeout: 180000000
+
+### eval
+val_size: 0
+per_device_eval_batch_size: 1
+eval_strategy: "no"
+eval_steps: 500

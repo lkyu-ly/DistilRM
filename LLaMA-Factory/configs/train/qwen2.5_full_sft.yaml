@@ -1,0 +1,37 @@
+### model
+model_name_or_path: ../models/Qwen2.5-3B-Instruct
+### method
+stage: sft
+do_train: true
+finetuning_type: full
+
+### dataset
+dataset_dir: data
+dataset: sft_qwen3-14b
+template: qwen
+cutoff_len: 1024
+max_samples: 100000
+overwrite_cache: true
+preprocessing_num_workers: 16
+
+### output
+output_dir: output/Qwen2.5-3B-Instruct-sft
+logging_steps: 1
+save_steps: 1000
+overwrite_output_dir: true
+
+### train
+per_device_train_batch_size: 8
+gradient_accumulation_steps: 8
+learning_rate: 1.0e-6
+num_train_epochs: 1.0
+lr_scheduler_type: cosine
+warmup_ratio: 0.003
+bf16: true
+ddp_timeout: 180000000
+
+### eval
+val_size: 0.0
+per_device_eval_batch_size: 1
+eval_strategy: 'no'
+eval_steps: 10

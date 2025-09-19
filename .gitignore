@@ -1,0 +1,5 @@
+output/*
+RewardTrainer/output/*
+*.log
+__pycache__/
+RewardTrainer/result/*

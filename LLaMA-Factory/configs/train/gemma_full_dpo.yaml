@@ -1,0 +1,41 @@
+### model
+model_name_or_path: model/gemma-2b-it
+
+### method
+stage: dpo
+do_train: true
+finetuning_type: full
+pref_beta: 0.05
+pref_loss: sigmoid  # choices: [sigmoid (dpo), orpo, simpo]
+pref_ftx: 0.5
+
+### dataset
+dataset_dir: data
+dataset: unified_dpo
+template: gemma
+cutoff_len: 1024
+max_samples: 1000000
+overwrite_cache: true
+
+### output
+output_dir: output/gemma-2b-it-unifie_dpo_sft_0.05_0.5_lr_1e-6_epoch_1
+logging_steps: 1
+save_steps: 1000
+plot_loss: true
+overwrite_output_dir: true
+
+### train
+per_device_train_batch_size: 4
+gradient_accumulation_steps: 16
+learning_rate: 1.0e-6
+num_train_epochs: 1.0
+lr_scheduler_type: cosine
+warmup_ratio: 0.1
+bf16: true
+ddp_timeout: 180000000
+
+### eval
+val_size: 0
+per_device_eval_batch_size: 1
+eval_strategy: "no"
+eval_steps: 500

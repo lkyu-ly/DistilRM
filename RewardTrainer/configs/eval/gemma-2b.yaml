@@ -1,0 +1,14 @@
+prompt: gemma
+vllm_args:
+  model_args:
+    model: output/Qwen2.5-3B-Instruct-webgpt_et_lr_1e-6_epoch_1
+    dtype: float16
+    tensor_parallel_size: 1
+    trust_remote_code: true
+  sampling_params:
+    temperature: 0
+    max_tokens: 20
+hf_args:
+  model_args:
+    model: google/gemma-2b-it
+    dtype: float16
