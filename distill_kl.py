@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import os
 import argparse
 import json
 import torch
@@ -11,6 +12,8 @@ from transformers import (
     TrainingArguments,
 )
 from tqdm import tqdm
+from torch.distributed.fsdp import StateDictType, FullStateDictConfig
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 
 def safe_item(x):
@@ -163,24 +166,29 @@ class DistillTrainer(Trainer):
 
     # ---------- 设备同步 ----------
     def _sync_teacher_device(self, model):
+        """
+        检查教师模型是否与学生模型分片在同一设备上。
+        在 FSDP 中，我们假设教师模型在 Trainer 初始化时已经被正确放置。
+        """
         if self.teacher is None:
             return
+
         try:
+            # 获取当前输入数据所在的设备 (即当前 FSDP 分片所在的设备)
             model_device = next(model.parameters()).device
         except StopIteration:
-            model_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            # 模型可能没有参数（例如在某些初始化阶段）
+            return
 
-        if hasattr(self.teacher, "device") and self.teacher.device != model_device:
-            self.teacher.to(model_device)
-        else:
-            for p in self.teacher.parameters():
-                if p.device != model_device:
-                    self.teacher.to(model_device)
-                    break
-            for b in self.teacher.buffers():
-                if b.device != model_device:
-                    self.teacher.to(model_device)
-                    break
+        # 检查教师模型参数是否在正确的设备上
+        teacher_device = next(self.teacher.parameters()).device
+
+        if teacher_device != model_device:
+            # 仅发出警告，不再尝试移动模型，因为那会导致 FSDP 死锁
+            print(
+                f"警告: 教师模型设备 ({teacher_device}) 与学生模型分片设备 ({model_device}) 不一致。"
+                "在 FSDP 模式下，请确保在训练前将教师模型移至正确的 local_rank。"
+            )
 
     # ---------- 计算 loss ----------
 
@@ -201,9 +209,15 @@ class DistillTrainer(Trainer):
         student_prefix_lens = inputs["student_prefix_len"]
         teacher_prefix_lens = inputs["teacher_prefix_len"]
 
-        # 只 forward 一次学生模型
-        s_out = model(input_ids=input_ids, attention_mask=attention_mask)
+        # ----------- LM-SFT loss ----------
+        s_out = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=labels if self.lm_weight > 0 else None,
+        )
+
         student_logits = s_out.logits
+        lm_loss = s_out.loss if self.lm_weight > 0 else torch.tensor(0.0, device=device)
 
         # ----------- KL(teacher||student) ----------
         kl_loss = 0.0
@@ -226,10 +240,6 @@ class DistillTrainer(Trainer):
             # 对每个样本进行前缀掩码和对齐
             batch_kl_losses = []
 
-            # 添加调试信息
-            if self.args.local_rank in (-1, 0) and self.state.global_step % 5 == 0:
-                print("\nKL 散度计算调试信息:")
-
             for b in range(batch_size):
                 teacher_start = teacher_prefix_lens[b]
                 student_start = student_prefix_lens[b]
@@ -250,22 +260,6 @@ class DistillTrainer(Trainer):
                     b : b + 1, student_start : student_start + min_len, :
                 ]
 
-                # 调试：检查切片的统计信息
-                if (
-                    self.args.local_rank in (-1, 0)
-                    and self.state.global_step % 5 == 0
-                    and b == 0
-                ):
-                    print(
-                        f"  样本{b}: teacher_slice shape={teacher_slice.shape}, student_slice shape={student_slice.shape}"
-                    )
-                    print(
-                        f"  teacher logits 统计: mean={teacher_slice.mean().item():.4f}, std={teacher_slice.std().item():.4f}"
-                    )
-                    print(
-                        f"  student logits 统计: mean={student_slice.mean().item():.4f}, std={student_slice.std().item():.4f}"
-                    )
-
                 t_log_prob = F.log_softmax(teacher_slice / T, dim=-1)
                 s_log_prob = F.log_softmax(student_slice / T, dim=-1)
                 t_prob = torch.exp(t_log_prob)
@@ -277,38 +271,9 @@ class DistillTrainer(Trainer):
                 shift_labels = labels[
                     b : b + 1, student_start + 1 : student_start + 1 + min_len
                 ]
-                kl_mask = (shift_labels != -100).to(per_token_kl.dtype)
+                kl_mask = (shift_labels != -100).to(dtype=per_token_kl.dtype)
 
                 total_nonpad = kl_mask.sum()
-
-                # 调试：检查 KL 散度值
-                if (
-                    self.args.local_rank in (-1, 0)
-                    and self.state.global_step % 5 == 0
-                    and b == 0
-                ):
-                    print(f"  per_token_kl 前 10 个值: {per_token_kl[0, :10].tolist()}")
-                    print(f"  kl_mask 前 10 个值: {kl_mask[0, :10].tolist()}")
-                    print(f"  有效 token 数: {total_nonpad.item()}/{min_len}")
-
-                    # 检查是否有异常大的 KL 值
-                    max_kl = per_token_kl.max().item()
-                    mean_kl = per_token_kl.mean().item()
-                    print(f"  KL 散度统计: max={max_kl:.4f}, mean={mean_kl:.4f}")
-
-                    # 检查教师和学生的预测是否过于不同
-                    t_argmax = teacher_slice[0, :10].argmax(-1)
-                    s_argmax = student_slice[0, :10].argmax(-1)
-                    print(f"  教师前 10 个 token 预测: {t_argmax.tolist()}")
-                    print(f"  学生前 10 个 token 预测: {s_argmax.tolist()}")
-
-                    # 检查概率分布的熵
-                    t_entropy = -(t_prob[0, :10] * t_log_prob[0, :10]).sum(-1)
-                    s_entropy = -(
-                        torch.exp(s_log_prob[0, :10]) * s_log_prob[0, :10]
-                    ).sum(-1)
-                    print(f"  教师熵: {t_entropy.mean().item():.4f}")
-                    print(f"  学生熵: {s_entropy.mean().item():.4f}")
 
                 if total_nonpad.item() == 0:
                     sample_kl_loss = torch.tensor(0.0, device=device)
@@ -324,164 +289,8 @@ class DistillTrainer(Trainer):
             else:
                 kl_loss = torch.tensor(0.0, device=device)
 
-        # ----------- LM-SFT loss ----------
-        lm_loss = 0.0
-        if self.lm_weight > 0:
-            outputs = model(
-                input_ids=inputs["input_ids"],
-                attention_mask=inputs.get("attention_mask", None),
-                labels=labels,
-            )
-            lm_loss = outputs.loss
-
         # ----------- 加权 ----------
         loss = self.lm_weight * lm_loss + self.kl_weight * kl_loss
-        # 在调试部分添加更多检查
-        if self.args.local_rank in (-1, 0):
-            print(f"Loss requires_grad: {loss.requires_grad}")
-            b = 0
-            # 找到 answer 开始位置
-            ans_start = (labels[b] != -100).nonzero(as_tuple=True)[0]
-            if ans_start.numel() > 0:
-                ans_start = ans_start[0].item()
-                L = 15
-                print("\n" + "-" * 80)
-                print(f">>> STEP {self.state.global_step}  ANSWER 区段  <<<")
-
-                # 1. 检查模型设备和数据类型
-                print(f"Model device: {next(model.parameters()).device}")
-                print(f"Model dtype: {next(model.parameters()).dtype}")
-                print(f"Input device: {input_ids.device}")
-                print(f"Logits shape: {student_logits.shape}")
-                print(f"Logits dtype: {student_logits.dtype}")
-
-                # 2. 检查 logits 的统计信息
-                print(
-                    f"Logits stats - mean: {student_logits.mean().item():.4f}, std: {student_logits.std().item():.4f}"
-                )
-                print(
-                    f"Logits min: {student_logits.min().item():.4f}, max: {student_logits.max().item():.4f}"
-                )
-
-                # 3. 正确处理 shift
-                if ans_start > 0:  # 确保不会越界
-                    # logits[i] 预测 input_ids[i+1]
-                    print(
-                        "input_ids (被预测):",
-                        input_ids[b, ans_start : ans_start + L].tolist(),
-                    )
-                    print(
-                        "labels           :",
-                        labels[b, ans_start : ans_start + L].tolist(),
-                    )
-
-                    # 使用 ans_start-1 的 logits 来预测 ans_start 的 token
-                    logits_slice = student_logits[b, ans_start - 1 : ans_start + L - 1]
-                    probs = F.softmax(logits_slice, dim=-1)
-
-                    # 检查 softmax 后的概率
-                    print(f"Probs shape: {probs.shape}")
-                    print(f"Probs sum (should be ~1.0): {probs[0].sum().item():.4f}")
-
-                    # 模型预测的 token
-                    pred_ids = logits_slice.argmax(-1)
-
-                    # 获取真实标签的概率
-                    target_ids = input_ids[b, ans_start : ans_start + L]
-                    label_probs = []
-                    for i in range(min(L, len(target_ids))):
-                        if i < probs.shape[0]:
-                            prob = probs[i, target_ids[i]].item()
-                            label_probs.append(prob)
-
-                    print("模型预测     :", pred_ids.tolist()[: len(label_probs)])
-                    print("真实标签概率 :", [f"{p:.3f}" for p in label_probs])
-
-                    # 4. 检查前几个最高概率的预测
-                    top_k = 5
-                    top_probs, top_indices = torch.topk(probs[0], top_k)
-                    print(f"Top {top_k} predictions for first position:")
-                    print(f"  Indices: {top_indices.tolist()}")
-                    print(f"  Probs: {[f'{p:.3f}' for p in top_probs.tolist()]}")
-                    print(f"  Target token: {target_ids[0].item()}")
-
-                print("-" * 80 + "\n")
-        # ---------- 调试信息 ----------
-        if self.args.local_rank in (-1, 0):
-            from datetime import datetime
-
-            ts = datetime.now().strftime("%H:%M:%S")
-            print(
-                f"[{ts}] step={self.state.global_step}  "
-                f"lm_loss={safe_item(lm_loss):.6f}  kl_loss={safe_item(kl_loss):.6f}  "
-                f"total_loss={safe_item(loss):.6f}"
-            )
-
-            # 每 10 步打印详细调试信息
-            if self.state.global_step % 10 == 0:
-                # 检查 labels 中非 -100 的数量
-                valid_labels = (inputs["labels"] != -100).sum().item()
-                total_labels = inputs["labels"].numel()
-                print(
-                    f"Valid labels: {valid_labels}/{total_labels} ({valid_labels/total_labels*100:.1f}%)"
-                )
-
-                # 检查前缀长度差异
-                prefix_diff = [
-                    t - s
-                    for t, s in zip(
-                        teacher_prefix_lens.tolist(), student_prefix_lens.tolist()
-                    )
-                ]
-                print(f"前缀长度差异: {prefix_diff[:5]}...")
-
-        if (
-            self.kl_weight > 0
-            and self.teacher is not None
-            and self.state.global_step % 10 == 0
-        ):
-            print(
-                "🧑‍🏫 Teacher 最后 5 个位置 argmax:",
-                teacher_logits[0, -5:].argmax(-1).tolist(),
-            )
-            print(
-                "🧑‍🎓 Student 最后 5 个位置 argmax:",
-                student_logits[0, -5:].argmax(-1).tolist(),
-            )
-
-        # ======  对齐文本核对  ======
-        if (
-            self.args.local_rank in (-1, 0)
-            and self.state.global_step % 10 == 0
-            and self.kl_weight > 0
-        ):
-            b = 0  # 打印第一个样本
-            teacher_start = teacher_prefix_lens[b]
-            student_start = student_prefix_lens[b]
-
-            teacher_available_len = teacher_logits.shape[1] - teacher_start - 1
-            student_available_len = student_logits.shape[1] - student_start - 1
-            min_len = min(teacher_available_len, student_available_len)
-
-            print("\n" + "=" * 80)
-            print(
-                f"step={self.state.global_step}  teacher_start={teacher_start}, student_start={student_start}, min_len={min_len}"
-            )
-
-            if min_len > 0:
-                t_text = self.teacher_tokenizer.decode(
-                    teacher_input_ids[
-                        b, teacher_start : teacher_start + min(20, min_len)
-                    ],
-                    skip_special_tokens=False,
-                )
-                s_text = self.tokenizer.decode(
-                    input_ids[b, student_start : student_start + min(20, min_len)],
-                    skip_special_tokens=False,
-                )
-                print("教师片段（前 20 个 token）：", repr(t_text))
-                print("学生片段（前 20 个 token）：", repr(s_text))
-            print("=" * 80 + "\n")
 
         return (loss, s_out.logits) if return_outputs else loss
 
@@ -492,10 +301,10 @@ def main(
     teacher_name,
     data_path,
     output_dir,
-    ds_config,
+    gradient_accumulation_steps=1,
+    learning_rate=1e-5,
     num_epochs=1,
     batch_size=2,
-    gradient_accumulation_steps=1,
     max_length=512,
     lm_weight=1.0,
     kl_weight=0.0,
@@ -504,16 +313,32 @@ def main(
     student = AutoModelForCausalLM.from_pretrained(
         student_name, torch_dtype=torch.float16
     )
+    local_rank_str = os.environ.get("LOCAL_RANK")
+    if local_rank_str is not None:
+        local_rank = int(local_rank_str)
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print("未检测到 LOCAL_RANK，假定单卡或非 FSDP 启动。")
 
     # ----------- 按需加载教师模型 ----------
     teacher = None
     teacher_tokenizer = None
     if kl_weight > 0:
         print(f"kl_weight={kl_weight}，正在加载教师模型：{teacher_name}")
+
+        # 加载教师模型
         teacher = AutoModelForCausalLM.from_pretrained(
-            teacher_name, torch_dtype=torch.float16
-        ).eval()
-        teacher_tokenizer = AutoTokenizer.from_pretrained(teacher_name, use_fast=True)
+            teacher_name,
+            torch_dtype=torch.float16,
+        )
+        teacher.eval()
+
+        print(f"将教师模型移动到设备: {device}")
+        teacher.to(device)
+
+        for p in teacher.parameters():
+            p.requires_grad = False
     else:
         print("kl_weight=0，跳过教师模型加载，仅做 SFT")
 
@@ -525,12 +350,12 @@ def main(
         output_dir=output_dir,
         num_train_epochs=num_epochs,
         per_device_train_batch_size=batch_size,
-        learning_rate=1.0e-6,
+        learning_rate=learning_rate,
         logging_steps=1,
-        save_strategy="steps",
-        save_total_limit=1,
+        save_strategy="no",
+        save_total_limit=0,
+        save_only_model=True,
         bf16=True,
-        deepspeed=ds_config,
         gradient_checkpointing=True,
         remove_unused_columns=False,
         report_to="none",
@@ -553,6 +378,14 @@ def main(
 
     trainer.train()
 
+    # Save model
+    student.config.use_cache = True
+    save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+    with FSDP.state_dict_type(
+        trainer.model, StateDictType.FULL_STATE_DICT, save_policy
+    ):
+        trainer.save_model()
+
 
 # ====================== 启动 ======================
 if __name__ == "__main__":
@@ -562,11 +395,11 @@ if __name__ == "__main__":
     parser.add_argument("--data_path", type=str, required=True)
     parser.add_argument("--output_dir", type=str, default="./distilled_student")
     parser.add_argument(
-        "--ds_config", type=str, required=True, help="DeepSpeed 配置 JSON"
+        "--gradient_accumulation_steps", type=int, default=1, help="梯度累积步数"
     )
+    parser.add_argument("--learning_rate", type=float, default=1e-5)
     parser.add_argument("--num_epochs", type=int, default=1)
     parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--max_length", type=int, default=1024)
     parser.add_argument("--lm_weight", type=float, default=0.0, help="SFT loss 权重")
     parser.add_argument("--kl_weight", type=float, default=1.0, help="KL loss 权重")
@@ -577,10 +410,10 @@ if __name__ == "__main__":
         args.teacher_model,
         args.data_path,
         args.output_dir,
-        args.ds_config,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        learning_rate=args.learning_rate,
         num_epochs=args.num_epochs,
         batch_size=args.batch_size,
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
         max_length=args.max_length,
         lm_weight=args.lm_weight,
         kl_weight=args.kl_weight,

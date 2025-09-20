@@ -1,33 +1,29 @@
 #!/usr/bin/env bash
 # usage: bash run_kl.sh
-
-# export TRANSFORMERS_VERBOSITY=debug
-# export TOKENIZERS_PARALLELISM=false
-# export CUDA_LAUNCH_BLOCKING=1
-# export TORCH_DISTRIBUTED_DEBUG=DETAIL
-
-export MASTER_PORT=29500
-export CUDA_VISIBLE_DEVICES="2,3" 
+main_process_port=12540
+export CUDA_VISIBLE_DEVICES="0,1" 
 
 TEACHER=/H1/zhouhongli/models/Qwen3-14B
 STUDENT=/H1/zhouhongli/models/Qwen2.5-3B-Instruct
 DATA=responses/responses_qwen3-14b.jsonl
 OUT=../DistillOutput/sft_distill_Qwen2.5-3B-Instruct_Qwen3-14B
 
-GPUS=2
-GRAD_ACC=4
+n_gpu=2
+gradient_accumulation_steps=16
+learning_rate=1e-6
 
-torchrun --nproc_per_node=$GPUS distill_kl.py \
-  --student_model $STUDENT \
-  --teacher_model $TEACHER \
-  --data_path $DATA \
-  --output_dir $OUT \
-  --ds_config accelerate/ds_config.json \
-  --num_epochs 1 \
-  --batch_size 8 \
-  --gradient_accumulation_steps $GRAD_ACC \
-  --lm_weight 0 \
-  --kl_weight 1 \
-  --max_length 1024
-
-# 控制 GPUS * GRAD_ACC * batch_size = 64
+accelerate launch --num_processes ${n_gpu} \
+    --main_process_port ${main_process_port} \
+    --config_file accelerate/fsdp_config.yaml \
+    distill_kl.py \
+    --student_model $STUDENT \
+    --teacher_model $TEACHER \
+    --data_path $DATA \
+    --output_dir $OUT \
+    --gradient_accumulation_steps $gradient_accumulation_steps \
+    --learning_rate $learning_rate \
+    --num_epochs 1 \
+    --batch_size 1 \
+    --lm_weight 0.5 \
+    --kl_weight 0.5 \
+    --max_length 1024
