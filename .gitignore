@@ -3,3 +3,6 @@ RewardTrainer/output/*
 *.log
 __pycache__/
 RewardTrainer/result/*
+.spec-workflow/*
+doc/*
+RewardTrainer/tests/*
