@@ -82,14 +82,10 @@ class ScriptArguments:
     debug: Optional[bool] = field(
         default=False, metadata={"help": "if debug=True, only train with 100 samples"}
     )
-    # GRM
-    weight_ratio: Optional[float] = field(default=0.01)
-    beta: Optional[float] = field(default=0.1, metadata={"help": "beta for DPO"})
+    # Joint training核心参数 - value head相关配置 (用于GRM模型架构)
     layer_type: Optional[str] = field(default="mlp")  # mlp, linear
     num_layers: Optional[int] = field(default=1)
     num_neurons: Optional[int] = field(default=1024)
-    reference_free: Optional[bool] = field(default=True)
-    sft_only: Optional[bool] = field(default=True)
     no_logsigmoid_sft: Optional[bool] = field(default=False)
 
 
@@ -398,14 +394,8 @@ def main():
         print("Teacher model loaded and frozen")
 
     # Load student model (GRM model)
-    if not script_args.reference_free:
-        reference_model = AutoModelForCausalLM.from_pretrained(
-            script_args.base_model,
-            torch_dtype=torch.bfloat16,
-            attn_implementation="flash_attention_2",
-        )
-        reference_model.resize_token_embeddings(len(tokenizer))
-        reference_model.config.pad_token_id = tokenizer.pad_token_id
+    # reference_model不再使用，因为JointDistillRewardTrainer不调用GRM框架的reference相关逻辑
+    reference_model = None
 
     model = AutoModelForCausalLMWithValueHead.from_pretrained(
         script_args.base_model, torch_dtype=torch.bfloat16, **model_params
@@ -432,7 +422,7 @@ def main():
     # Define trainer parameters
     trainer_params = {
         "model": model,
-        "reference_model": reference_model if not script_args.reference_free else None,
+        "reference_model": reference_model,
         "teacher_model": teacher_model,
         "args": training_args,
         "tokenizer": tokenizer,
@@ -444,12 +434,11 @@ def main():
         "sft_weight": script_args.sft_weight,
         "kl_weight": script_args.kl_weight,
         "temperature": script_args.temperature,
-        # Reward model config
-        "weight_ratio": script_args.weight_ratio,
-        "reference_free": script_args.reference_free,
-        "sft_only": script_args.sft_only,
+        # GRM框架参数已被JointDistillRewardTrainer重写的compute_loss绕过，不再使用
+        "weight_ratio": 0,  # 设为0以确保不启用GRM框架的加权逻辑
+        "reference_free": True,  # 设为True确保不启用参考模型
+        "sft_only": True,  # 设为True确保使用SFT逻辑而非DPO
         "no_logsigmoid_sft": script_args.no_logsigmoid_sft,
-        "beta": script_args.beta,
         "info_to_save": {
             "base_model": script_args.base_model,
             "teacher_model": script_args.teacher_model,

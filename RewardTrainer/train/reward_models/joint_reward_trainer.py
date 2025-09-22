@@ -365,26 +365,3 @@ class JointDistillRewardTrainer(GRMRewardTrainer):
             }
 
         return total_loss
-
-
-class JointDistillRewardTrainerWithDPOSupport(JointDistillRewardTrainer):
-    """
-    扩展版本，支持DPO模式的联合训练
-    """
-
-    def __init__(self, **kwargs):
-        # DPO相关参数
-        self.reference_model = kwargs.pop("reference_model", None)
-        self.beta = kwargs.pop("beta", 0.1)
-
-        super().__init__(**kwargs)
-
-        # 设置参考模型（用于DPO）
-        if self.reference_model is not None:
-            self.reference_model.eval()
-            for p in self.reference_model.parameters():
-                p.requires_grad = False
-
-    def compute_dpo_loss(self, inputs):
-        """计算DPO损失（带参考模型）"""
-        return torch.tensor(0.0, device=inputs["input_ids"].device)
