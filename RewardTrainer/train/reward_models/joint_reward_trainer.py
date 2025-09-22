@@ -122,6 +122,9 @@ class JointDataCollatorWithPadding(GRMDataCollatorWithPadding):
 
                 student_prefix_lens.append(s_prefix_len)
 
+                # 检查是否是蒸馏数据（rejected为空的情况）
+                is_distill_data = feature.get("is_distill_data", False)
+
                 # 处理教师模型输入
                 teacher_result, t_prefix_len = self.process_teacher_input(messages)
 
@@ -137,6 +140,9 @@ class JointDataCollatorWithPadding(GRMDataCollatorWithPadding):
                         }
                     )
                     teacher_prefix_lens.append(s_prefix_len)
+
+                # 标记蒸馏数据以便训练器处理
+                feature["is_distill_data"] = is_distill_data
 
         # 对教师输入进行padding
         if teacher_features:
@@ -304,13 +310,34 @@ class JointDistillRewardTrainer(GRMRewardTrainer):
         jidx = torch.arange(0, batch_size, 2)  # chosen样本索引
         kidx = jidx + 1  # rejected样本索引
 
-        # 1. 计算奖励损失 (Reward Loss)
-        reward_loss = -nn.functional.logsigmoid(rewards[jidx] - rewards[kidx]).mean()
+        # 检测蒸馏样本（rejected样本与chosen样本相同的情况）
+        distill_indices = []
+        rm_indices = []
 
-        # 2. 计算SFT损失 (仅对chosen样本)
+        for i in range(len(jidx)):
+            chosen_idx = jidx[i]
+            rejected_idx = kidx[i]
+
+            # 检查rejected样本是否与chosen样本相同（蒸馏数据特征）
+            is_distill = torch.equal(inputs["input_ids"][chosen_idx], inputs["input_ids"][rejected_idx])
+            if is_distill:
+                distill_indices.append(i)
+            else:
+                rm_indices.append(i)
+
+        # 1. 计算奖励损失 (Reward Loss) - 只对非蒸馏样本
+        if rm_indices:
+            rm_jidx = jidx[rm_indices]
+            rm_kidx = kidx[rm_indices]
+            reward_loss = -nn.functional.logsigmoid(rewards[rm_jidx] - rewards[rm_kidx]).mean()
+        else:
+            # 如果没有非蒸馏样本，奖励损失为0
+            reward_loss = torch.tensor(0.0, device=device)
+
+        # 2. 计算SFT损失 (对所有chosen样本，包括蒸馏样本)
         if self.sft_weight > 0:
             logps = self.get_batch_logps(lm_logits, inputs["label"])
-            sft_loss = -logps[jidx].mean()  # 只使用chosen样本的log概率
+            sft_loss = -logps[jidx].mean()  # 使用所有chosen样本的log概率
         else:
             sft_loss = torch.tensor(0.0, device=device)
 
@@ -352,6 +379,8 @@ class JointDistillRewardTrainer(GRMRewardTrainer):
                         kl_loss.item() if isinstance(kl_loss, torch.Tensor) else kl_loss
                     ),
                     "loss_total": total_loss.item(),
+                    "num_distill_samples": len(distill_indices),
+                    "num_rm_samples": len(rm_indices),
                 }
                 self.log(logs)
 

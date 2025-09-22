@@ -11,7 +11,8 @@ main_process_port=12542
 # 基础配置
 STUDENT_MODEL=/H1/zhouhongli/models/Qwen2.5-3B-Instruct
 TEACHER_MODEL=/H1/zhouhongli/models/Qwen3-14B
-DATASET='data/skywork_10k_rm.json'
+RM_DATASET='data/skywork_10k_rm.json'
+DISTILL_DATASET='../responses/responses_qwen3-14b.jsonl'
 OUTPUT_DIR="./joint_reward_models_train"
 
 # 训练超参数
@@ -41,7 +42,8 @@ echo "Starting Joint Distillation + Reward Model Training..."
 echo "Configuration:"
 echo "  Student Model: $STUDENT_MODEL"
 echo "  Teacher Model: $TEACHER_MODEL"
-echo "  Dataset: $DATASET"
+echo "  RM Dataset: $RM_DATASET"
+echo "  Distill Dataset: $DISTILL_DATASET"
 echo "  Loss Weights - Reward: $reward_weight, SFT: $sft_weight, KL: $kl_weight"
 echo "  Output: $OUTPUT_DIR"
 echo "  GPUs: $CUDA_VISIBLE_DEVICES (using $n_gpu GPUs)"
@@ -59,7 +61,8 @@ accelerate launch --num_processes ${n_gpu} \
     train/reward_models/run_joint_distill_reward_train.py \
     --base_model ${STUDENT_MODEL} \
     --teacher_model ${TEACHER_MODEL} \
-    --dataset ${DATASET} \
+    --dataset ${RM_DATASET} \
+    --distill_dataset ${DISTILL_DATASET} \
     --kl_weight ${kl_weight} \
     --sft_weight ${sft_weight} \
     --reward_weight ${reward_weight} \

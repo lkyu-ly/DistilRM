@@ -42,7 +42,12 @@ class ScriptArguments:
     bf16: Optional[bool] = field(default=True)
     attn_implementation: Optional[str] = field(default="")
     # data
-    dataset: Optional[str] = field(default="llm-blender/Unified-Feedback")
+    dataset: Optional[str] = field(default="llm-blender/Unified-Feedback",
+        metadata={"help": "Path to preference dataset (RM training) in JSON format"}
+    )
+    distill_dataset: Optional[str] = field(default=None,
+        metadata={"help": "Path to distillation dataset (KL/SFT training) in JSONL format"}
+    )
     dataset_mode: Optional[str] = field(
         default="",
         metadata={"help": "use from '', '40k', and '400k' for the paper's experiments"},
@@ -152,11 +157,15 @@ def main():
         teacher_tokenizer.max_length = script_args.max_length
 
     # Load datasets
-    print(f"Loading dataset: {script_args.dataset}")
+    print(f"Loading preference dataset: {script_args.dataset}")
+    if script_args.distill_dataset:
+        print(f"Loading distillation dataset: {script_args.distill_dataset}")
+    else:
+        print("No distillation dataset provided, using preference dataset for all training")
 
     # 使用特殊的预处理来包含消息结构
     def custom_load_train_eval_dataset(
-        data_path, tokenizer, size=None, mode="", max_length=512
+        data_path, tokenizer, size=None, mode="", max_length=512, is_distill_data=False
     ):
         """修改版本的数据加载函数，包含消息结构信息"""
         from datasets import load_dataset
@@ -165,7 +174,21 @@ def main():
         logging.basicConfig(level=logging.INFO)
 
         try:
-            ds = load_dataset("json", data_files=data_path, split="train")
+            if data_path.endswith('.jsonl'):
+                # 加载JSONL格式的蒸馏数据
+                ds = load_dataset("json", data_files=data_path, split="train")
+                if 'question' in ds.features and 'response' in ds.features:
+                    # 如果是蒸馏数据格式（问答对），转换为偏好数据格式
+                    def convert_distill_to_preferred_format(example):
+                        return {
+                            "prompt": example["question"],
+                            "chosen": example["response"],
+                            "rejected": ""  # 为蒸馏数据创建空rejected作为占位符
+                        }
+                    ds = ds.map(convert_distill_to_preferred_format)
+            else:
+                # 加载JSON格式的偏好数据
+                ds = load_dataset("json", data_files=data_path, split="train")
             logging.info(f"Loaded dataset from {data_path} with {len(ds)} examples")
         except Exception as e:
             logging.error(f"Failed to load dataset from {data_path}: {e}")
@@ -184,14 +207,22 @@ def main():
             if not prompt:
                 raise ValueError(f"Empty prompt in example: {example}")
 
+            # 处理蒸馏数据（rejected为空的情况
+            is_distill_data = (not rejected or rejected.strip() == "" or rejected.strip() == " ") and example.get("rejected") == ""
+
             chosen_messages = [
                 {"role": "user", "content": prompt},
                 {"role": "assistant", "content": chosen},
             ]
-            rejected_messages = [
-                {"role": "user", "content": prompt},
-                {"role": "assistant", "content": rejected},
-            ]
+
+            # 如果是蒸馏数据，为rejected创建一个虚拟响应
+            if is_distill_data:
+                rejected_messages = chosen_messages  # 使用相同的内容，后面DataCollator会处理
+            else:
+                rejected_messages = [
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": rejected},
+                ]
 
             result = {
                 "chosen": chosen_messages,
@@ -202,6 +233,7 @@ def main():
                     {"role": "user", "content": prompt}
                 ],  # 用户部分单独保存
                 "rejected_user_messages": [{"role": "user", "content": prompt}],
+                "is_distill_data": is_distill_data,  # 标记是否是蒸馏数据
             }
 
             # 添加评分信息（如果存在）
@@ -343,14 +375,62 @@ def main():
         ds.set_format(type="torch")
         return ds
 
-    # 使用自定义函数加载数据
-    train_dataset = custom_load_train_eval_dataset(
-        script_args.dataset,
-        tokenizer,
-        split="train",
-        size=100 if script_args.debug else None,
-        max_length=script_args.max_length,
-    )
+    # 如果提供了蒸馏数据集，准备复合数据集
+    if script_args.distill_dataset:
+        # 加载偏好数据集用于RM训练
+        print("Loading preference dataset for reward modeling...")
+        rm_train_dataset = custom_load_train_eval_dataset(
+            script_args.dataset,
+            tokenizer,
+            split="train",
+            size=100 if script_args.debug else None,
+            max_length=script_args.max_length,
+        )
+
+        # 加载蒸馏数据集用于KL/SFT训练
+        print("Loading distillation dataset for KL/SFT training...")
+        distill_train_dataset = custom_load_train_eval_dataset(
+            script_args.distill_dataset,
+            tokenizer,
+            split="train",
+            size=100 if script_args.debug else None,
+            max_length=script_args.max_length,
+            is_distill_data=True
+        )
+
+        # 创建复合数据集（交替使用RM和蒸馏样本）
+        class CombinedDataset:
+            def __init__(self, rm_dataset, distill_dataset):
+                self.rm_dataset = rm_dataset
+                self.distill_dataset = distill_dataset
+                self.rm_length = len(rm_dataset)
+                self.distill_length = len(distill_dataset)
+                self.length = max(self.rm_length, self.distill_length)
+
+            def __len__(self):
+                return self.length
+
+            def __getitem__(self, index):
+                # 交替返回RM和蒸馏样本
+                if index % 2 == 0:  # 偶数索引返回RM样本
+                    rm_idx = index % self.rm_length
+                    return self.rm_dataset[rm_idx]
+                else:  # 奇数索引返回蒸馏样本
+                    distill_idx = index % self.distill_length
+                    return self.distill_dataset[distill_idx]
+
+        train_dataset = CombinedDataset(rm_train_dataset, distill_train_dataset)
+        print(f"Combined training dataset size: {len(train_dataset)}")
+
+    else:
+        # 如果未提供蒸馏数据集，使用单一偏好数据集
+        train_dataset = custom_load_train_eval_dataset(
+            script_args.dataset,
+            tokenizer,
+            split="train",
+            size=100 if script_args.debug else None,
+            max_length=script_args.max_length,
+        )
 
     eval_dataset = custom_load_train_eval_dataset(
         script_args.dataset,
