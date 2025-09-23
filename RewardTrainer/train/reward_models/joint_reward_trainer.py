@@ -62,21 +62,15 @@ class JointDataCollatorWithPadding:
 
         for feature in features:
             # teacher response for distillation
-            teacher_features.append(feature["teacher_input_ids"])
-            teacher_attention_masks.append(feature["teacher_attention_mask"])
+            teacher_features.append({
+                "input_ids": feature["teacher_input_ids"],
+                "attention_mask": feature["teacher_attention_mask"]
+            })
             teacher_prefix_lengths.append(feature["teacher_prefix_len"])
             student_prefix_lengths.append(feature["student_prefix_len"])
 
         teacher_batch = self.tokenizer.pad(
-            [{"input_ids": ids} for ids in teacher_features],
-            padding=self.padding,
-            max_length=self.max_length,
-            pad_to_multiple_of=self.pad_to_multiple_of,
-            return_tensors=self.return_tensors,
-        )
-
-        teacher_attention_batch = self.tokenizer.pad(
-            [{"attention_mask": mask} for mask in teacher_attention_masks],
+            teacher_features,
             padding=self.padding,
             max_length=self.max_length,
             pad_to_multiple_of=self.pad_to_multiple_of,
@@ -90,7 +84,7 @@ class JointDataCollatorWithPadding:
             "label": label_paded,
             # 蒸馏相关字段
             "teacher_input_ids": teacher_batch["input_ids"],
-            "teacher_attention_mask": teacher_attention_batch["attention_mask"],
+            "teacher_attention_mask": teacher_batch["attention_mask"],
             "teacher_prefix_len": teacher_prefix_lengths,
             "student_prefix_len": student_prefix_lengths,
         }
@@ -138,7 +132,7 @@ class JointRewardTrainer(RewardTrainer):
         return (per_token_logps * loss_mask).sum(-1)
 
 
-    def compute_loss(self, model, inputs, return_outputs=False):
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         # 获取模型输出: logits, last_hidden_state, rewards
         logits, last_hidden_state, rewards = model(
             input_ids=inputs["input_ids"],
@@ -164,6 +158,13 @@ class JointRewardTrainer(RewardTrainer):
         # ========== 3. KL Loss ==========
         kl_loss = torch.tensor(0.0, device=rewards.device)
         if self.kl_weight > 0 and self.teacher_model is not None:
+            # # 获取教师模型所在的设备
+            # teacher_device = next(self.teacher_model.parameters()).device
+            
+            # # 将教师模型输入数据移动到教师模型所在的设备
+            # teacher_input_ids = inputs["teacher_input_ids"].to(teacher_device)
+            # teacher_attention_mask = inputs["teacher_attention_mask"].to(teacher_device)
+            
             with torch.no_grad():
                 # 教师模型前向传播
                 teacher_output = self.teacher_model(
