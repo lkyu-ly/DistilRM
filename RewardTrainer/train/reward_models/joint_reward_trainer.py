@@ -1,396 +1,291 @@
-"""
-Fixed Joint Distill Reward Trainer
-联合奖励模型和知识蒸馏训练器
-"""
-
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Union
+from accelerate import Accelerator
+import numpy as np
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from grm_reward_trainer import GRMDataCollatorWithPadding, GRMRewardTrainer
-
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
-import torch
+from base_trainer import RewardTrainer
+from transformers.utils import PaddingStrategy
 from transformers import AutoTokenizer
+from utils import get_trainable_weights
 
 
 @dataclass
-class JointDataCollatorWithPadding(GRMDataCollatorWithPadding):
-    """简化版本的联合数据collator，只处理必要的功能"""
-
-    teacher_tokenizer: Optional[AutoTokenizer] = None
-
-    def get_user_prefix_length(self, tokenizer, messages):
-        """计算用户前缀长度"""
-        if not messages or len(messages) == 0:
-            return 0
-
-        # 获取用户对话部分
-        user_messages = []
-        for msg in messages[:-1]:  # 除了最后一条assistant消息
-            user_messages.append(msg)
-
-        if not user_messages:
-            return 0
-
-        user_text = tokenizer.apply_chat_template(
-            user_messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=False,
-        )
-
-        user_tokens = tokenizer(
-            user_text,
-            add_special_tokens=False,
-            truncation=True,
-            max_length=tokenizer.model_max_length or 1024,
-            return_tensors=None,
-        )
-        return len(user_tokens["input_ids"])
-
-    def process_teacher_input(self, chosen_messages):
-        """处理教师模型输入"""
-        if not self.teacher_tokenizer or not chosen_messages:
-            return None, 0
-
-        if len(chosen_messages) < 2:
-            return None, 0
-
-        try:
-            # 生成完整对话的tokens
-            teacher_text = self.teacher_tokenizer.apply_chat_template(
-                chosen_messages,
-                tokenize=False,
-                add_generation_prompt=False,
-                enable_thinking=False,
-            )
-
-            teacher_tokens = self.teacher_tokenizer(
-                teacher_text,
-                truncation=True,
-                max_length=self.max_length or 1024,
-                padding="max_length",
-                return_tensors="pt",
-            )
-
-            # 计算用户前缀长度
-            teacher_prefix_len = self.get_user_prefix_length(
-                self.teacher_tokenizer, chosen_messages
-            )
-
-            return {
-                "input_ids": teacher_tokens["input_ids"][0],
-                "attention_mask": teacher_tokens["attention_mask"][0],
-            }, teacher_prefix_len
-
-        except Exception as e:
-            print(f"Error processing teacher input: {e}")
-            # 出错时返回默认值
-            fake_ids = torch.zeros(self.max_length or 512, dtype=torch.long)
-            fake_mask = torch.zeros(self.max_length or 512, dtype=torch.long)
-            return {"input_ids": fake_ids, "attention_mask": fake_mask}, 0
+class JointDataCollatorWithPadding:
+    tokenizer: AutoTokenizer
+    padding: Union[bool, str, PaddingStrategy] = True
+    max_length: Optional[int] = None
+    pad_to_multiple_of: Optional[int] = None
+    return_tensors: str = "pt"
+    label_pad_token_id = -100
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """主要的collator函数"""
-        # 先调用父类方法获取基本的批次数据
-        batch = super().__call__(features)
+        # 处理 RM 训练部分：chosen 和 rejected
+        merged_features = []
+        for feature in features:
+            merged_features.append(
+                {
+                    "input_ids": feature["input_ids_chosen"],
+                    "attention_mask": feature["attention_mask_chosen"],
+                }
+            )
+            merged_features.append(
+                {
+                    "input_ids": feature["input_ids_rejected"],
+                    "attention_mask": feature["attention_mask_rejected"],
+                }
+            )
+        batch = self.tokenizer.pad(
+            merged_features,
+            padding=self.padding,
+            max_length=self.max_length,
+            pad_to_multiple_of=self.pad_to_multiple_of,
+            return_tensors=self.return_tensors,
+        )
 
-        if self.teacher_tokenizer is None:
-            return batch
+        # pad labels for RM part
+        paded_length = batch["input_ids"].shape[1]
+        label_paded = []
+        for feature in features:
+            label_chosen_paded = torch.tensor(feature["label_chosen"].tolist() + [self.label_pad_token_id] * (paded_length - len(feature["label_chosen"])) , dtype=torch.int64)
+            label_rejected_paded = torch.tensor(feature["label_rejected"].tolist() + [self.label_pad_token_id] * (paded_length - len(feature["label_rejected"])) , dtype=torch.int64)
+            label_paded.extend([label_chosen_paded.view(1, -1), label_rejected_paded.view(1, -1)])
+        label_paded = torch.concatenate(label_paded, dim=0)
 
-        device = batch["input_ids"].device
-
-        # 处理chosen样本（用于蒸馏的只有chosen样本）
+        # 处理蒸馏部分：teacher response
         teacher_features = []
-        student_prefix_lens = []
-        teacher_prefix_lens = []
+        teacher_attention_masks = []
+        teacher_prefix_lengths = []
+        student_prefix_lengths = []
 
-        # features是成对出现的：0=chosen, 1=rejected, 2=chosen, 3=rejected...
-        for i, feature in enumerate(features):
-            if i % 2 == 0:  # chosen样本
-                # 获取chosen的对话消息
-                if "chosen_messages" in feature:
-                    messages = feature["chosen_messages"]
-                else:
-                    messages = []
+        for feature in features:
+            # teacher response for distillation
+            teacher_features.append(feature["teacher_input_ids"])
+            teacher_attention_masks.append(feature["teacher_attention_mask"])
+            teacher_prefix_lengths.append(feature["teacher_prefix_len"])
+            student_prefix_lengths.append(feature["student_prefix_len"])
 
-                # 计算学生模型前缀长度
-                s_prefix_len = 0
-                if messages:
-                    s_prefix_len = self.get_user_prefix_length(self.tokenizer, messages)
+        teacher_batch = self.tokenizer.pad(
+            [{"input_ids": ids} for ids in teacher_features],
+            padding=self.padding,
+            max_length=self.max_length,
+            pad_to_multiple_of=self.pad_to_multiple_of,
+            return_tensors=self.return_tensors,
+        )
 
-                student_prefix_lens.append(s_prefix_len)
+        teacher_attention_batch = self.tokenizer.pad(
+            [{"attention_mask": mask} for mask in teacher_attention_masks],
+            padding=self.padding,
+            max_length=self.max_length,
+            pad_to_multiple_of=self.pad_to_multiple_of,
+            return_tensors=self.return_tensors,
+        )
 
-                # 检查是否是蒸馏数据（rejected为空的情况）
-                is_distill_data = feature.get("is_distill_data", False)
-
-                # 处理教师模型输入
-                teacher_result, t_prefix_len = self.process_teacher_input(messages)
-
-                if teacher_result:
-                    teacher_features.append(teacher_result)
-                    teacher_prefix_lens.append(t_prefix_len)
-                else:
-                    # 如果没有有效的教师输入，使用学生输入作为占位符
-                    teacher_features.append(
-                        {
-                            "input_ids": feature["input_ids_chosen"],
-                            "attention_mask": feature["attention_mask_chosen"],
-                        }
-                    )
-                    teacher_prefix_lens.append(s_prefix_len)
-
-                # 标记蒸馏数据以便训练器处理
-                feature["is_distill_data"] = is_distill_data
-
-        # 对教师输入进行padding
-        if teacher_features:
-            teacher_batch = self.teacher_tokenizer.pad(
-                teacher_features,
-                padding=self.padding,
-                max_length=self.max_length,
-                pad_to_multiple_of=self.pad_to_multiple_of,
-                return_tensors="pt",
-            )
-
-            # 添加到批次
-            batch.update(
-                {
-                    "teacher_input_ids": teacher_batch["input_ids"].to(device),
-                    "teacher_attention_mask": teacher_batch["attention_mask"].to(
-                        device
-                    ),
-                    "student_prefix_len": torch.tensor(
-                        student_prefix_lens, dtype=torch.long
-                    ).to(device),
-                    "teacher_prefix_len": torch.tensor(
-                        teacher_prefix_lens, dtype=torch.long
-                    ).to(device),
-                }
-            )
-        else:
-            # 如果没有有效的教师特征，使用默认值
-            chosen_count = len([i for i in range(len(features)) if i % 2 == 0])
-            fake_ids = torch.zeros(
-                (chosen_count, self.max_length or 512), dtype=torch.long
-            ).to(device)
-            fake_mask = torch.zeros(
-                (chosen_count, self.max_length or 512), dtype=torch.long
-            ).to(device)
-
-            batch.update(
-                {
-                    "teacher_input_ids": fake_ids,
-                    "teacher_attention_mask": fake_mask,
-                    "student_prefix_len": torch.zeros(
-                        chosen_count, dtype=torch.long
-                    ).to(device),
-                    "teacher_prefix_len": torch.zeros(
-                        chosen_count, dtype=torch.long
-                    ).to(device),
-                }
-            )
-
+        batch = {
+            "input_ids": batch["input_ids"],
+            "attention_mask": batch["attention_mask"],
+            "return_loss": True,
+            "label": label_paded,
+            # 蒸馏相关字段
+            "teacher_input_ids": teacher_batch["input_ids"],
+            "teacher_attention_mask": teacher_attention_batch["attention_mask"],
+            "teacher_prefix_len": teacher_prefix_lengths,
+            "student_prefix_len": student_prefix_lengths,
+        }
         return batch
 
 
-class JointDistillRewardTrainer(GRMRewardTrainer):
-    """
-    联合训练奖励模型和知识蒸馏的新训练器
-    同时优化：奖励损失 + SFT损失 + KL蒸馏损失
-    """
-
+class JointRewardTrainer(RewardTrainer):
     def __init__(self, **kwargs):
-        # 提取联合训练相关的参数
-        self.teacher_model = kwargs.pop("teacher_model", None)
-        self.reward_weight = kwargs.pop("reward_weight", 1.0)
-        self.sft_weight = kwargs.pop("sft_weight", 0.1)
-        self.kl_weight = kwargs.pop("kl_weight", 0.1)
-        self.temperature = kwargs.pop("temperature", 1.0)
+        # RM 训练相关参数
+        self.use_lora = kwargs.pop('use_lora', True)
+        self.info_to_save = kwargs.pop('info_to_save', {})
 
-        # 调用父类构造函数
-        super().__init__(**kwargs)
-
-        # 设置教师模型
-        if self.teacher_model is not None:
-            self.teacher_model.eval()
-            for p in self.teacher_model.parameters():
-                p.requires_grad = False
-
+        # 蒸馏相关参数
+        self.teacher_model = kwargs.pop('teacher_model', None)
+        self.temperature = kwargs.pop('temperature', 1.0)
         self.eps = 1e-9
 
-    def compute_kl_loss(
+        # 损失权重
+        self.reward_weight = kwargs.pop('reward_weight', 1.0)
+        self.sft_weight = kwargs.pop('sft_weight', 1.0)
+        self.kl_weight = kwargs.pop('kl_weight', 1.0)
+
+        self.label_pad_token_id = -100
+        # 初始化全局步数计数器
+        self.global_step = 0
+        super(JointRewardTrainer, self).__init__(**kwargs)
+
+
+    def get_batch_logps(
         self,
-        student_logits,
-        teacher_logits,
-        student_prefix_len,
-        teacher_prefix_len,
-        labels,
-    ):
-        """
-        计算KL散度蒸馏损失，基于distill_kl.py的实现
-        """
-        device = student_logits.device
-        batch_size = student_logits.shape[0]
+        logits: torch.FloatTensor,
+        labels: torch.LongTensor,
+        average_log_prob: bool = False,
+    ) -> torch.FloatTensor:
+        """Compute the log probabilities of the given labels under the given logits."""
+        if logits.shape[:-1] != labels.shape:
+            raise ValueError("Logits (batch and sequence length dim) and labels must have the same shape.")
 
-        kl_losses = []
+        labels = labels[:, 1:].clone()
+        logits = logits[:, :-1, :]
+        loss_mask = labels != self.label_pad_token_id
 
-        for b in range(batch_size):
-            s_prefix = (
-                student_prefix_len[b].item()
-                if hasattr(student_prefix_len[b], "item")
-                else student_prefix_len[b]
-            )
-            t_prefix = (
-                teacher_prefix_len[b].item()
-                if hasattr(teacher_prefix_len[b], "item")
-                else teacher_prefix_len[b]
-            )
+        labels[labels == self.label_pad_token_id] = 0
+        per_token_logps = torch.gather(logits.log_softmax(-1), dim=2, index=labels.unsqueeze(2)).squeeze(2)
+        return (per_token_logps * loss_mask).sum(-1)
 
-            # 计算可对齐长度
-            teacher_available_len = teacher_logits.shape[1] - t_prefix - 1
-            student_available_len = student_logits.shape[1] - s_prefix - 1
-            min_len = min(teacher_available_len, student_available_len)
 
-            if min_len <= 0:
-                kl_losses.append(torch.tensor(0.0, device=device))
-                continue
+    def compute_loss(self, model, inputs, return_outputs=False):
+        # 获取模型输出: logits, last_hidden_state, rewards
+        logits, last_hidden_state, rewards = model(
+            input_ids=inputs["input_ids"],
+            attention_mask=inputs["attention_mask"]
+        )
 
-            # 截取assistant响应部分进行对齐
-            teacher_slice = teacher_logits[b : b + 1, t_prefix : t_prefix + min_len, :]
-            student_slice = student_logits[b : b + 1, s_prefix : s_prefix + min_len, :]
+        # ========== 1. RM Loss ==========
+        bsz = rewards.size(0)
+        jidx = torch.arange(0, bsz, 2)  # chosen_ids
+        kidx = jidx + 1                 # rejected_ids
+        reward_loss = -nn.functional.logsigmoid(rewards[jidx] - rewards[kidx]).mean()
+
+        # ========== 2. SFT Loss ==========
+        sft_loss = torch.tensor(0.0, device=rewards.device)
+        if self.sft_weight > 0:
+            # 使用 chosen 部分计算 SFT loss
+            chosen_logits = logits[jidx]
+            chosen_labels = inputs['label'][jidx]
+            logps_chosen = self.get_batch_logps(chosen_logits, chosen_labels)
+            # 使用 log sigmoid 作为 SFT loss，类似于 GRM 的做法
+            sft_loss = -F.logsigmoid(logps_chosen).mean()
+
+        # ========== 3. KL Loss ==========
+        kl_loss = torch.tensor(0.0, device=rewards.device)
+        if self.kl_weight > 0 and self.teacher_model is not None:
+            with torch.no_grad():
+                # 教师模型前向传播
+                teacher_output = self.teacher_model(
+                    input_ids=inputs["teacher_input_ids"],
+                    attention_mask=inputs["teacher_attention_mask"]
+                )
+                teacher_logits = teacher_output.logits
 
             T = float(self.temperature)
+            batch_size = logits.shape[0] // 2  # 只使用 chosen 部分
 
-            # 计算softmax和log_softmax
-            t_log_prob = F.log_softmax(teacher_slice / T, dim=-1)
-            s_log_prob = F.log_softmax(student_slice / T, dim=-1)
-            t_prob = torch.exp(t_log_prob)
+            # 对每个样本计算 KL 散度
+            batch_kl_losses = []
 
-            # 计算KL散度
-            per_elem = t_prob * (t_log_prob - s_log_prob)
-            per_token_kl = per_elem.sum(dim=-1)
+            for b in range(batch_size):
+                # 获取前缀长度
+                teacher_start = inputs["teacher_prefix_len"][b]
+                student_start = inputs["student_prefix_len"][b]
 
-            # 应用mask：只计算非padding部分的损失
-            if labels.dim() == 2 and labels.shape[0] == batch_size:
-                shift_labels = labels[b : b + 1, s_prefix + 1 : s_prefix + 1 + min_len]
-                kl_mask = (shift_labels != -100).to(dtype=per_token_kl.dtype)
+                # 获取学生模型的 chosen logits
+                student_logits_slice = logits[jidx[b]:jidx[b]+1]
+
+                # 计算可对齐长度
+                teacher_available_len = teacher_logits.shape[1] - teacher_start - 1
+                student_available_len = student_logits_slice.shape[1] - student_start - 1
+                min_len = min(teacher_available_len, student_available_len)
+
+                if min_len <= 0:
+                    batch_kl_losses.append(torch.tensor(0.0, device=logits.device))
+                    continue
+
+                # 截取对应片段
+                teacher_slice = teacher_logits[b:b+1, teacher_start:teacher_start+min_len, :]
+                student_slice = student_logits_slice[:, student_start:student_start+min_len, :]
+
+                # 计算 KL 散度
+                t_log_prob = F.log_softmax(teacher_slice / T, dim=-1)
+                s_log_prob = F.log_softmax(student_slice / T, dim=-1)
+                t_prob = torch.exp(t_log_prob)
+
+                per_elem = t_prob * (t_log_prob - s_log_prob)
+                per_token_kl = per_elem.sum(dim=-1)
+
+                # 使用 labels 进行 mask
+                chosen_labels_slice = inputs['label'][jidx[b]:jidx[b]+1, student_start+1:student_start+1+min_len]
+                kl_mask = (chosen_labels_slice != -100).to(dtype=per_token_kl.dtype)
+
                 total_nonpad = kl_mask.sum()
 
                 if total_nonpad.item() == 0:
-                    kl_loss = torch.tensor(0.0, device=device)
+                    sample_kl_loss = torch.tensor(0.0, device=logits.device)
                 else:
-                    kl_loss = (per_token_kl * kl_mask).sum() / (total_nonpad + self.eps)
+                    sample_kl_loss = (per_token_kl * kl_mask).sum() / (total_nonpad + self.eps)
+
+                batch_kl_losses.append(sample_kl_loss * (T * T))
+
+            if batch_kl_losses:
+                kl_loss = torch.stack(batch_kl_losses).mean()
             else:
-                # 如果没有labels，使用简单平均
-                kl_loss = per_token_kl.mean()
+                kl_loss = torch.tensor(0.0, device=logits.device)
 
-            # 乘以温度平方（蒸馏中的标准做法）
-            kl_losses.append(kl_loss * (T * T))
-
-        if kl_losses:
-            return torch.stack(kl_losses).mean()
-        else:
-            return torch.tensor(0.0, device=device)
-
-    def compute_loss(self, model, inputs, return_outputs=False):
-        """
-        联合训练的核心损失计算
-        同时计算：奖励损失 + SFT损失 + KL蒸馏损失
-        """
-        device = next(model.parameters()).device
-
-        # 获取学生模型输出 (使用GRM模型)(lm_logits, _, value)
-        lm_logits, _, rewards = model(
-            input_ids=inputs["input_ids"], attention_mask=inputs["attention_mask"]
-        )
-
-        batch_size = rewards.size(0)
-        jidx = torch.arange(0, batch_size, 2)  # chosen样本索引
-        kidx = jidx + 1  # rejected样本索引
-
-        # 检测蒸馏样本（rejected样本与chosen样本相同的情况）
-        distill_indices = []
-        rm_indices = []
-
-        for i in range(len(jidx)):
-            chosen_idx = jidx[i]
-            rejected_idx = kidx[i]
-
-            # 检查rejected样本是否与chosen样本相同（蒸馏数据特征）
-            is_distill = torch.equal(inputs["input_ids"][chosen_idx], inputs["input_ids"][rejected_idx])
-            if is_distill:
-                distill_indices.append(i)
-            else:
-                rm_indices.append(i)
-
-        # 1. 计算奖励损失 (Reward Loss) - 只对非蒸馏样本
-        if rm_indices:
-            rm_jidx = jidx[rm_indices]
-            rm_kidx = kidx[rm_indices]
-            reward_loss = -nn.functional.logsigmoid(rewards[rm_jidx] - rewards[rm_kidx]).mean()
-        else:
-            # 如果没有非蒸馏样本，奖励损失为0
-            reward_loss = torch.tensor(0.0, device=device)
-
-        # 2. 计算SFT损失 (对所有chosen样本，包括蒸馏样本)
-        if self.sft_weight > 0:
-            logps = self.get_batch_logps(lm_logits, inputs["label"])
-            sft_loss = -logps[jidx].mean()  # 使用所有chosen样本的log概率
-        else:
-            sft_loss = torch.tensor(0.0, device=device)
-
-        # 3. 计算KL蒸馏损失 (仅对chosen样本)
-        kl_loss = torch.tensor(0.0, device=device)
-        if self.kl_weight > 0 and self.teacher_model is not None:
-            with torch.no_grad():
-                # 获取教师模型输出
-                teacher_output = self.teacher_model(
-                    input_ids=inputs["teacher_input_ids"],
-                    attention_mask=inputs["teacher_attention_mask"],
-                )
-                teacher_lm_logits = teacher_output.logits
-
-            # 只对学生模型中的chosen样本计算KL损失
-            chosen_student_logits = lm_logits[jidx]  # 只取chosen样本
-            kl_loss = self.compute_kl_loss(
-                chosen_student_logits,
-                teacher_lm_logits,
-                inputs["student_prefix_len"],
-                inputs["teacher_prefix_len"],
-                inputs["label"][jidx],
-            )
-
-        # 4. 组合总损失
+        # ========== 4. 总损失 ==========
         total_loss = (
-            self.reward_weight * reward_loss
-            + self.sft_weight * sft_loss
-            + self.kl_weight * kl_loss
+            self.reward_weight * reward_loss +
+            self.sft_weight * sft_loss +
+            self.kl_weight * kl_loss
         )
 
-        # 记录详细的损失信息用于监控
-        if hasattr(self, "state") and hasattr(self.state, "global_step"):
-            if self.state.global_step % max(1, self.args.logging_steps) == 0:
-                logs = {
-                    "loss_reward": reward_loss.item(),
-                    "loss_sft": sft_loss.item(),
-                    "loss_kl": (
-                        kl_loss.item() if isinstance(kl_loss, torch.Tensor) else kl_loss
-                    ),
-                    "loss_total": total_loss.item(),
-                    "num_distill_samples": len(distill_indices),
-                    "num_rm_samples": len(rm_indices),
-                }
-                self.log(logs)
+        # 打印损失信息（仅在主进程打印）
+        if hasattr(self, 'global_step'):
+            self.global_step += 1
+        else:
+            self.global_step = 1
+
+        if self.accelerator.is_main_process:
+            # 转换为CPU标量以便打印
+            reward_loss_val = reward_loss.detach().cpu().item()
+            sft_loss_val = sft_loss.detach().cpu().item()
+            kl_loss_val = kl_loss.detach().cpu().item()
+            total_loss_val = total_loss.detach().cpu().item()
+
+            # 计算加权后的各个损失分量
+            weighted_reward = self.reward_weight * reward_loss_val
+            weighted_sft = self.sft_weight * sft_loss_val
+            weighted_kl = self.kl_weight * kl_loss_val
+
+            print(f"\n[Step {self.global_step}] 损失详细信息:")
+            print(f"  - RM Loss (raw):     {reward_loss_val:.6f} | Weighted: {weighted_reward:.6f} (weight={self.reward_weight})")
+            print(f"  - SFT Loss (raw):    {sft_loss_val:.6f} | Weighted: {weighted_sft:.6f} (weight={self.sft_weight})")
+            print(f"  - KL Loss (raw):     {kl_loss_val:.6f} | Weighted: {weighted_kl:.6f} (weight={self.kl_weight})")
+            print(f"  - Total Loss:        {total_loss_val:.6f}")
+            print(f"  - Loss Components:   RM={weighted_reward/total_loss_val*100:.1f}% | SFT={weighted_sft/total_loss_val*100:.1f}% | KL={weighted_kl/total_loss_val*100:.1f}%")
+            print("-" * 80)
 
         if return_outputs:
             return total_loss, {
-                "rewards": rewards,
-                "lm_logits": lm_logits,
                 "reward_loss": reward_loss,
                 "sft_loss": sft_loss,
                 "kl_loss": kl_loss,
+                "total_loss": total_loss
             }
-
         return total_loss
+
+
+    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
+        inputs = self._prepare_inputs(inputs)
+        with torch.no_grad():
+            logits, _, rewards = model(input_ids=inputs["input_ids"], attention_mask=inputs["attention_mask"])
+            logps = self.get_batch_logps(logits, inputs['label'])
+
+        return (None, logps.reshape(-1, 2), rewards.reshape(-1, 2))
+
+
+    def save_model(self, output_dir=None, _internal_call=False):
+        if self.args.should_save and self.accelerator.is_main_process:
+            os.makedirs(output_dir, exist_ok=True)
+            model = self.accelerator.unwrap_model(self.model)
+            ## add config
+            model.config.vhead_layer_type = self.info_to_save['layer_type']
+            model.config.vhead_num_neurons = self.info_to_save['num_neurons']
+            model.config.vhead_num_layers = self.info_to_save['num_layers']
+
+            state_dict = get_trainable_weights(model)
+            model.save_pretrained(output_dir, state_dict=state_dict, safe_serialization=False)
+            self.tokenizer.save_pretrained(output_dir)
