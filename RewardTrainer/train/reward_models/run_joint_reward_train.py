@@ -9,7 +9,7 @@ from transformers import (
     AutoModelForCausalLM,
 )
 from joint_reward_trainer import JointDataCollatorWithPadding, JointRewardTrainer
-from load_datasets import load_joint_train_eval_dataset
+from load_joint_datasets import load_joint_train_eval_dataset
 from utils import print_trainable_parameters
 from grm_utils import AutoModelForCausalLMWithValueHead
 
@@ -28,7 +28,7 @@ class ScriptArguments:
         metadata={"help": "The number of training epochs for the reward model."},
     )
     optim: Optional[str] = field(
-        default="adamw_hf", metadata={"help": "The optimizer to use."}
+        default="adamw_torch", metadata={"help": "The optimizer to use."}
     )
     lr_scheduler_type: Optional[str] = field(
         default="cosine",
@@ -93,7 +93,8 @@ training_args = TrainingArguments(
     per_device_train_batch_size=script_args.per_device_train_batch_size,
     per_device_eval_batch_size=script_args.per_device_eval_batch_size,
     num_train_epochs=script_args.num_train_epochs,
-    evaluation_strategy=script_args.evaluation_strategy,
+    # evaluation_strategy=script_args.evaluation_strategy,
+    eval_strategy=script_args.evaluation_strategy,
     eval_steps=script_args.eval_steps,
     save_strategy=script_args.save_strategy,
     save_steps=script_args.save_steps,

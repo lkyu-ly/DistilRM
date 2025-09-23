@@ -2,9 +2,9 @@
 
 export NCCL_P2P_DISABLE=1
 export WANDB_MODE=offline
-export CUDA_VISIBLE_DEVICES=2,3,5,7
+export CUDA_VISIBLE_DEVICES=1,7,3,4
 
-dataset_name='RewardTrainer/data/skywork_10k_joint.json'
+dataset_name='data/skywork_10k_joint.json'
 base_model='/H1/zhouhongli/models/Qwen2.5-3B-Instruct'
 teacher_model='/H1/zhouhongli/models/Qwen3-14B'
 log_dir='./reward_models_train'
@@ -14,14 +14,14 @@ n_gpu=4
 learning_rate=1e-6
 max_length=1024
 num_train_epochs=1
-per_device_train_batch_size=1
-gradient_accumulation_steps=128
+per_device_train_batch_size=2
+gradient_accumulation_steps=16
 
 # Joint training parameters
 # 不强制权重和为1
 reward_weight=1.0
 sft_weight=1.0
-kl_weight=0.5
+kl_weight=1.0
 temperature=1.0
 
 # Value head parameters
@@ -31,7 +31,7 @@ num_neurons=1024
 
 accelerate launch --num_processes ${n_gpu} \
     --main_process_port ${main_process_port} \
-    --config_file accelerate/fsdp_config.yaml \
+    --config_file ../accelerate/fsdp_config.yaml \
     train/reward_models/run_joint_reward_train.py \
     --base_model ${base_model} \
     --teacher_model ${teacher_model} \

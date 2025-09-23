@@ -246,7 +246,7 @@ def load_joint_train_eval_dataset(
         max_length=max_length,
     )
     dataset_split = dataset.train_test_split(test_size=0.01)
-    train_dataset, eval_dataset = dataset, dataset_split["test"]
+    train_dataset, eval_dataset = dataset_split["train"], dataset_split["test"]
     logging.info(
         f"Joint train dataset size: {len(train_dataset)}, Eval dataset size: {len(eval_dataset)}"
     )
