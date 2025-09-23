@@ -147,24 +147,44 @@ class JointRewardTrainer(RewardTrainer):
 
         # ========== 2. SFT Loss ==========
         sft_loss = torch.tensor(0.0, device=rewards.device)
-        if self.sft_weight > 0:
-            # 使用 chosen 部分计算 SFT loss
-            chosen_logits = logits[jidx]
-            chosen_labels = inputs['label'][jidx]
-            logps_chosen = self.get_batch_logps(chosen_logits, chosen_labels)
-            # 使用 log sigmoid 作为 SFT loss，类似于 GRM 的做法
-            sft_loss = -F.logsigmoid(logps_chosen).mean()
+        if self.sft_weight > 0 and self.teacher_model is not None:
+            # SFT损失应该学习teacher_response，我们需要基于teacher_input_ids计算学生模型的logits
+            batch_size = logits.shape[0] // 2
+            batch_sft_losses = []
+
+            for b in range(batch_size):
+                # 获取teacher_response的输入序列
+                teacher_input_ids_batch = inputs["teacher_input_ids"][b:b+1]
+                teacher_attention_mask_batch = inputs["teacher_attention_mask"][b:b+1]
+                teacher_prefix_len = inputs["teacher_prefix_len"][b]
+
+                # 计算学生模型在teacher_response上的logits
+                with torch.no_grad():
+                    # 获取学生模型在teacher_input_ids上的输出
+                    sft_logits, _, _ = model(
+                        input_ids=teacher_input_ids_batch,
+                        attention_mask=teacher_attention_mask_batch
+                    )
+
+                # 构建labels：基于teacher_response，prefix部分mask为-100
+                labels = teacher_input_ids_batch.clone()
+                labels[0, :teacher_prefix_len] = -100  # mask prefix部分
+
+                # 计算SFT损失
+                sft_logps = self.get_batch_logps(sft_logits, labels)
+                sft_loss_sample = -F.logsigmoid(sft_logps).mean()
+                batch_sft_losses.append(sft_loss_sample)
+
+            if batch_sft_losses:
+                sft_loss = torch.stack(batch_sft_losses).mean()
+            else:
+                sft_loss = torch.tensor(0.0, device=logits.device)
 
         # ========== 3. KL Loss ==========
         kl_loss = torch.tensor(0.0, device=rewards.device)
         if self.kl_weight > 0 and self.teacher_model is not None:
-            # # 获取教师模型所在的设备
-            # teacher_device = next(self.teacher_model.parameters()).device
-            
-            # # 将教师模型输入数据移动到教师模型所在的设备
-            # teacher_input_ids = inputs["teacher_input_ids"].to(teacher_device)
-            # teacher_attention_mask = inputs["teacher_attention_mask"].to(teacher_device)
-            
+            # KL损失应该基于teacher_response计算教师和学生模型的对齐
+
             with torch.no_grad():
                 # 教师模型前向传播
                 teacher_output = self.teacher_model(
@@ -174,31 +194,35 @@ class JointRewardTrainer(RewardTrainer):
                 teacher_logits = teacher_output.logits
 
             T = float(self.temperature)
-            batch_size = logits.shape[0] // 2  # 只使用 chosen 部分
-
-            # 对每个样本计算 KL 散度
+            batch_size = logits.shape[0] // 2
             batch_kl_losses = []
 
             for b in range(batch_size):
-                # 获取前缀长度
-                teacher_start = inputs["teacher_prefix_len"][b]
-                student_start = inputs["student_prefix_len"][b]
+                # 获取teacher_response的输入序列
+                teacher_input_ids_batch = inputs["teacher_input_ids"][b:b+1]
+                teacher_attention_mask_batch = inputs["teacher_attention_mask"][b:b+1]
+                teacher_prefix_len = inputs["teacher_prefix_len"][b]
+                student_prefix_len = inputs["student_prefix_len"][b]
 
-                # 获取学生模型的 chosen logits
-                student_logits_slice = logits[jidx[b]:jidx[b]+1]
+                # 计算学生模型在teacher_response上的logits
+                with torch.no_grad():
+                    kl_logits, _, _ = model(
+                        input_ids=teacher_input_ids_batch,
+                        attention_mask=teacher_attention_mask_batch
+                    )
 
-                # 计算可对齐长度
-                teacher_available_len = teacher_logits.shape[1] - teacher_start - 1
-                student_available_len = student_logits_slice.shape[1] - student_start - 1
+                # 计算可对齐长度 (去除prefix部分，并且考虑logits的shift)
+                teacher_available_len = teacher_logits.shape[1] - teacher_prefix_len - 1
+                student_available_len = kl_logits.shape[1] - student_prefix_len - 1
                 min_len = min(teacher_available_len, student_available_len)
 
                 if min_len <= 0:
                     batch_kl_losses.append(torch.tensor(0.0, device=logits.device))
                     continue
 
-                # 截取对应片段
-                teacher_slice = teacher_logits[b:b+1, teacher_start:teacher_start+min_len, :]
-                student_slice = student_logits_slice[:, student_start:student_start+min_len, :]
+                # 截取对应片段 (去除prefix，并且考虑logits的shift)
+                teacher_slice = teacher_logits[b:b+1, teacher_prefix_len:teacher_prefix_len+min_len, :]
+                student_slice = kl_logits[b:b+1, student_prefix_len:student_prefix_len+min_len, :]
 
                 # 计算 KL 散度
                 t_log_prob = F.log_softmax(teacher_slice / T, dim=-1)
@@ -208,9 +232,10 @@ class JointRewardTrainer(RewardTrainer):
                 per_elem = t_prob * (t_log_prob - s_log_prob)
                 per_token_kl = per_elem.sum(dim=-1)
 
-                # 使用 labels 进行 mask
-                chosen_labels_slice = inputs['label'][jidx[b]:jidx[b]+1, student_start+1:student_start+1+min_len]
-                kl_mask = (chosen_labels_slice != -100).to(dtype=per_token_kl.dtype)
+                # 使用 labels 进行 mask (参照distill_kl.py的做法)
+                teacher_response_tokens = teacher_input_ids_batch[0, teacher_prefix_len:teacher_prefix_len+min_len]
+                shift_labels = teacher_response_tokens.unsqueeze(0)
+                kl_mask = (shift_labels != self.tokenizer.pad_token_id).to(dtype=per_token_kl.dtype)
 
                 total_nonpad = kl_mask.sum()
 
