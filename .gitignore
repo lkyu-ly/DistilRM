@@ -6,3 +6,4 @@ RewardTrainer/result/*
 .spec-workflow
 doc/*
 RewardTrainer/tests/*
+reward_models_train
