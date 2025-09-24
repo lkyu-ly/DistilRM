@@ -2,11 +2,11 @@
 
 export NCCL_P2P_DISABLE=1
 export WANDB_MODE=offline
-export CUDA_VISIBLE_DEVICES="4,7"
+# export CUDA_VISIBLE_DEVICES="0,1"
 
 dataset_name='data/skywork_10k_joint.json'
-base_model='/H1/zhouhongli/models/Qwen2.5-3B-Instruct'
-teacher_model='/H1/zhouhongli/models/Qwen3-14B'
+base_model='/root/models/Qwen2.5-3B-Instruct'
+teacher_model='/root/models/Qwen3-14B'
 log_dir='./reward_models_train'
 main_process_port=12542
 
@@ -14,8 +14,8 @@ n_gpu=2
 learning_rate=1e-6
 max_length=1024
 num_train_epochs=1
-per_device_train_batch_size=1
-gradient_accumulation_steps=16
+per_device_train_batch_size=4
+gradient_accumulation_steps=8
 
 # Joint training parameters
 # 不强制权重和为1

@@ -166,7 +166,7 @@ if script_args.kl_weight > 0 and script_args.teacher_model:
         script_args.teacher_model,
         device_map="auto",
         torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
+        # attn_implementation="flash_attention_2",
     )
     teacher_model.eval()
     for p in teacher_model.parameters():
@@ -177,7 +177,7 @@ model = AutoModelForCausalLMWithValueHead.from_pretrained(
     script_args.base_model, torch_dtype=torch.bfloat16, **model_params
 )
 
-model.pretrained_model.resize_token_embeddings(len(tokenizer))
+# model.pretrained_model.resize_token_embeddings(len(tokenizer))
 print_trainable_parameters(model)
 model.config.pad_token_id = tokenizer.pad_token_id
 
