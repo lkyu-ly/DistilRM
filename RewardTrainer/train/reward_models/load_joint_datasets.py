@@ -49,8 +49,7 @@ def build_joint_dataset(
         result = {
             "chosen": chosen_messages,
             "rejected": rejected_messages,
-            # "teacher_response": teacher_response, ???
-            "teacher_response": teacher_messages,
+            "teacher_response": teacher_response,
         }
         chosen_score, rejected_score = example.get("chosen_score"), example.get(
             "rejected_score"
@@ -119,15 +118,19 @@ def build_joint_dataset(
             # Tokenize teacher response for KL distillation
             teacher_kwargs = kwargs.copy()
             if teacher_tokenizer:
+                teacher_messages = [
+                    {"role": "user", "content": example["chosen"][0]["content"]},
+                    {"role": "assistant", "content": example["teacher_response"]},
+                ]
                 prompt_plus_teacher_response = teacher_tokenizer.apply_chat_template(
-                    example["teacher_response"], tokenize=False
+                    teacher_messages, tokenize=False, add_generation_prompt=False
                 )
                 teacher_tokens = teacher_tokenizer.encode_plus(
                     prompt_plus_teacher_response, **teacher_kwargs
                 )
 
                 # Get teacher prefix length
-                teacher_prompt = example["teacher_response"][:-1]
+                teacher_prompt = [{"role": "user", "content": example["chosen"][0]["content"]}]
                 teacher_prompt_template = teacher_tokenizer.apply_chat_template(
                     teacher_prompt, tokenize=False, add_generation_prompt=True
                 )
