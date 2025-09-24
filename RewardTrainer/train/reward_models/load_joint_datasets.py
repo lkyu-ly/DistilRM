@@ -41,19 +41,19 @@ def build_joint_dataset(
             {"role": "user", "content": prompt},
             {"role": "assistant", "content": rejected},
         ]
-        teacher_messages = [
-            {"role": "user", "content": prompt},
-            {"role": "assistant", "content": teacher_response},
-        ]
+        # teacher_messages = [
+        #     {"role": "user", "content": prompt},
+        #     {"role": "assistant", "content": teacher_response},
+        # ]
 
         result = {
             "chosen": chosen_messages,
             "rejected": rejected_messages,
-            "teacher_response": teacher_response,
+            "teacher_response": teacher_response,  # 直接返回
         }
-        chosen_score, rejected_score = example.get("chosen_score"), example.get(
-            "rejected_score"
-        )
+        chosen_score = example.get("chosen_score")
+        rejected_score = example.get("rejected_score")
+
         if chosen_score is not None:
             result["chosen_score"] = chosen_score
         if rejected_score is not None:
@@ -102,7 +102,6 @@ def build_joint_dataset(
                     logging.warning(f"Shape mismatch in {key} for example: {example}")
                     return None
 
-            # Create labels for SFT
             prompt = example["chosen"][:-1]
             prompt_template = tokenizer.apply_chat_template(
                 prompt, tokenize=False, add_generation_prompt=True
@@ -116,32 +115,56 @@ def build_joint_dataset(
             label_rejected[: len(tokens_prompt)] = -100
 
             # Tokenize teacher response for KL distillation
+            # KL部分，注意：
+            # 教师模型的输出分布：通过教师模型对相同内容（但可能使用不同tokenizer）的前向传播得到的logits
+            # 学生模型的输出分布：通过学生模型对相同内容的前向传播得到的logits
             teacher_kwargs = kwargs.copy()
+
+            # 教师模型输入
             if teacher_tokenizer:
                 teacher_messages = [
-                    {"role": "user", "content": example["chosen"][0]["content"]},
+                    {
+                        "role": "user",
+                        "content": example["chosen"][0]["content"],
+                    },  # 这里用的是chosen的prompt（相同的），但是回答用的确实是teacher_response
                     {"role": "assistant", "content": example["teacher_response"]},
                 ]
-                prompt_plus_teacher_response = teacher_tokenizer.apply_chat_template(
-                    teacher_messages, tokenize=False, add_generation_prompt=False
+                teacher_text = teacher_tokenizer.apply_chat_template(
+                    teacher_messages,
+                    tokenize=False,
+                    add_generation_prompt=False,
+                    enable_thinking=False,
                 )
-                teacher_tokens = teacher_tokenizer.encode_plus(
-                    prompt_plus_teacher_response, **teacher_kwargs
+                teacher_tokens = teacher_tokenizer(
+                    teacher_text,
+                    truncation=True,
+                    max_length=max_length,
+                    padding="max_length",
+                    **teacher_kwargs,
                 )
 
                 # Get teacher prefix length
-                teacher_prompt = [{"role": "user", "content": example["chosen"][0]["content"]}]
-                teacher_prompt_template = teacher_tokenizer.apply_chat_template(
-                    teacher_prompt, tokenize=False, add_generation_prompt=True
+                teacher_user_only_text = teacher_tokenizer.apply_chat_template(
+                    [{"role": "user", "content": example["chosen"][0]["content"]}],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    enable_thinking=False,
                 )
-                teacher_tokens_prompt = teacher_tokenizer.encode_plus(
-                    teacher_prompt_template, **teacher_kwargs
-                )["input_ids"][0]
-                teacher_prefix_len = len(teacher_tokens_prompt)
+                teacher_user_only_ids = teacher_tokenizer.encode_plus(
+                    teacher_user_only_text,
+                    add_special_tokens=False,
+                    truncation=True,
+                    max_length=max_length,
+                    **teacher_kwargs,
+                )[
+                    "input_ids"
+                ][0]
+                teacher_prefix_len = len(teacher_user_only_ids)
             else:
                 # If no teacher tokenizer, use student tokenizer
                 teacher_tokens = tokens_chosen
                 teacher_prefix_len = len(tokens_prompt)
+                print("Error: No teacher tokenizer provided.")
 
             student_prefix_len = len(tokens_prompt)
 
