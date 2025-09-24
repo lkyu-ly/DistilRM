@@ -15,7 +15,8 @@ def build_joint_dataset(
 ):
     try:
         ds = load_dataset("json", data_files=data_path, split="train")
-        logging.info(f"Loaded joint dataset from {data_path} with {len(ds)} examples")
+        logging.info(
+            f"Loaded joint dataset from {data_path} with {len(ds)} examples")
     except Exception as e:
         logging.error(f"Failed to load dataset from {data_path}: {e}")
         raise
@@ -83,10 +84,12 @@ def build_joint_dataset(
                 not prompt_plus_chosen_response.strip()
                 or not prompt_plus_rejected_response.strip()
             ):
-                logging.warning(f"Empty tokenized response in example: {example}")
+                logging.warning(
+                    f"Empty tokenized response in example: {example}")
                 return None
 
-            tokens_chosen = tokenizer.encode_plus(prompt_plus_chosen_response, **kwargs)
+            tokens_chosen = tokenizer.encode_plus(
+                prompt_plus_chosen_response, **kwargs)
             tokens_rejected = tokenizer.encode_plus(
                 prompt_plus_rejected_response, **kwargs
             )
@@ -99,14 +102,15 @@ def build_joint_dataset(
                     tokens["input_ids"].shape[1] != max_length
                     or tokens["attention_mask"].shape[1] != max_length
                 ):
-                    logging.warning(f"Shape mismatch in {key} for example: {example}")
+                    logging.warning(
+                        f"Shape mismatch in {key} for example: {example}")
                     return None
 
             prompt = example["chosen"][:-1]
             prompt_template = tokenizer.apply_chat_template(
                 prompt, tokenize=False, add_generation_prompt=True
             )
-            tokens_prompt = tokenizer.encode_plus(prompt_template, **kwargs)[
+            tokens_prompt = tokenizer.encode_plus(prompt_template, add_special_tokens=False, truncation=True, return_tensors="pt")[
                 "input_ids"
             ][0]
             label_chosen = tokens_chosen["input_ids"][0].clone()
@@ -127,7 +131,8 @@ def build_joint_dataset(
                         "role": "user",
                         "content": example["chosen"][0]["content"],
                     },  # 这里用的是chosen的prompt（相同的），但是回答用的确实是teacher_response
-                    {"role": "assistant", "content": example["teacher_response"]},
+                    {"role": "assistant",
+                        "content": example["teacher_response"]},
                 ]
                 teacher_text = teacher_tokenizer.apply_chat_template(
                     teacher_messages,
@@ -137,9 +142,6 @@ def build_joint_dataset(
                 )
                 teacher_tokens = teacher_tokenizer(
                     teacher_text,
-                    truncation=True,
-                    max_length=max_length,
-                    padding="max_length",
                     **teacher_kwargs,
                 )
 
@@ -155,7 +157,7 @@ def build_joint_dataset(
                     add_special_tokens=False,
                     truncation=True,
                     max_length=max_length,
-                    **teacher_kwargs,
+                    return_tensors="pt",
                 )[
                     "input_ids"
                 ][0]

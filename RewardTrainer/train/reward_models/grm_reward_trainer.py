@@ -98,9 +98,9 @@ class GRMRewardTrainer(RewardTrainer):
         per_token_logps = torch.gather(logits.log_softmax(-1), dim=2, index=labels.unsqueeze(2)).squeeze(2)
         return (per_token_logps * loss_mask).sum(-1)
 
-
-    def compute_loss(self, model, inputs, return_outputs=False):
-        logits, _,  rewards = model(input_ids=inputs["input_ids"], attention_mask=inputs["attention_mask"])
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        logits, _,  rewards = model(
+            input_ids=inputs["input_ids"], attention_mask=inputs["attention_mask"])
         if not self.reference_free:
             with torch.no_grad():
                 ref_logits = self.reference_model(input_ids=inputs["input_ids"], attention_mask=inputs["attention_mask"])[0]

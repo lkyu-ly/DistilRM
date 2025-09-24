@@ -2,14 +2,14 @@
 
 export NCCL_P2P_DISABLE=1
 export WANDB_MODE=offline
-export CUDA_VISIBLE_DEVICES=2,3,5,7
+export CUDA_VISIBLE_DEVICES=0,1
 
-dataset_name='data/helpsteer2-skywork-dpo.json'
-base_model='models/Mistral-7B-Instruct-v0.3'
-log_dir='output'
+dataset_name='data/skywork_10k_joint.json'
+base_model='/root/autodl-tmp/models/Qwen2.5-3B-Instruct'
+log_dir='/root/autodl-tmp/output'
 main_process_port=12541
 
-n_gpu=4
+n_gpu=2
 learning_rate=2e-6
 max_length=1024
 num_train_epochs=1

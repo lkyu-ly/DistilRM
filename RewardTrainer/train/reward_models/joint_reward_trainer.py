@@ -150,7 +150,10 @@ class JointRewardTrainer(RewardTrainer):
         per_token_logps = torch.gather(
             logits.log_softmax(-1), dim=2, index=labels.unsqueeze(2)
         ).squeeze(2)
-        return (per_token_logps * loss_mask).sum(-1)
+        logps = (per_token_logps * loss_mask).sum(-1)   # sum over tokens
+        token_counts = loss_mask.sum(-1).clamp(min=1)
+        logps = logps / token_counts                # average per token
+        return logps
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         # 获取模型输出: logits, last_hidden_state, rewards
@@ -193,7 +196,7 @@ class JointRewardTrainer(RewardTrainer):
 
                 # 计算SFT损失
                 sft_logps = self.get_batch_logps(sft_logits, labels)
-                sft_loss_sample = -F.logsigmoid(sft_logps).mean()
+                sft_loss_sample = -sft_logps.mean()
                 batch_sft_losses.append(sft_loss_sample)
 
             if batch_sft_losses:
@@ -201,11 +204,6 @@ class JointRewardTrainer(RewardTrainer):
             else:
                 sft_loss = torch.tensor(0.0, device=logits.device)
 
-        # 调试信息打印（仅在主进程打印，且仅前5步打印）
-        if self.accelerator.is_main_process and self.global_step <= 5:
-            print("teacher_input_ids[0]:", inputs["teacher_input_ids"][0])
-            print("teacher_prefix_len[0]:", inputs["teacher_prefix_len"][0])
-            print("teacher_attention_mask[0]:", inputs["teacher_attention_mask"][0])
 
         # ========== 3. KL Loss ==========
         kl_loss = torch.tensor(0.0, device=rewards.device)
@@ -296,39 +294,6 @@ class JointRewardTrainer(RewardTrainer):
             + self.kl_weight * kl_loss
         )
 
-        # 打印损失信息（仅在主进程打印）
-        if hasattr(self, "global_step"):
-            self.global_step += 1
-        else:
-            self.global_step = 1
-
-        if self.accelerator.is_main_process:
-            # 转换为CPU标量以便打印
-            reward_loss_val = reward_loss.detach().cpu().item()
-            sft_loss_val = sft_loss.detach().cpu().item()
-            kl_loss_val = kl_loss.detach().cpu().item()
-            total_loss_val = total_loss.detach().cpu().item()
-
-            # 计算加权后的各个损失分量
-            weighted_reward = self.reward_weight * reward_loss_val
-            weighted_sft = self.sft_weight * sft_loss_val
-            weighted_kl = self.kl_weight * kl_loss_val
-
-            print(f"\n[Step {self.global_step}] 损失详细信息:")
-            print(
-                f"  - RM Loss (raw):     {reward_loss_val:.6f} | Weighted: {weighted_reward:.6f} (weight={self.reward_weight})"
-            )
-            print(
-                f"  - SFT Loss (raw):    {sft_loss_val:.6f} | Weighted: {weighted_sft:.6f} (weight={self.sft_weight})"
-            )
-            print(
-                f"  - KL Loss (raw):     {kl_loss_val:.6f} | Weighted: {weighted_kl:.6f} (weight={self.kl_weight})"
-            )
-            print(f"  - Total Loss:        {total_loss_val:.6f}")
-            print(
-                f"  - Loss Components:   RM={weighted_reward/total_loss_val*100:.1f}% | SFT={weighted_sft/total_loss_val*100:.1f}% | KL={weighted_kl/total_loss_val*100:.1f}%"
-            )
-            print("-" * 80)
 
         if return_outputs:
             return total_loss, {

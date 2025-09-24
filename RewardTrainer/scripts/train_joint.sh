@@ -5,23 +5,22 @@ export WANDB_MODE=offline
 # export CUDA_VISIBLE_DEVICES="0,1"
 
 dataset_name='data/skywork_10k_joint.json'
-base_model='/root/models/Qwen2.5-3B-Instruct'
-teacher_model='/root/models/Qwen3-14B'
-log_dir='./reward_models_train'
+base_model='/root/autodl-tmp/models/Qwen2.5-3B-Instruct'
+teacher_model='/root/autodl-tmp/models/Qwen3-14B'
+log_dir='/root/autodl-tmp/output'
 main_process_port=12542
 
 n_gpu=2
 learning_rate=1e-6
 max_length=1024
 num_train_epochs=1
-per_device_train_batch_size=4
+per_device_train_batch_size=1
 gradient_accumulation_steps=8
 
 # Joint training parameters
-# 不强制权重和为1
-reward_weight=1.0
-sft_weight=1.0
-kl_weight=1.0
+reward_weight=0.98
+sft_weight=0.01
+kl_weight=0.01
 temperature=1.0
 
 # Value head parameters
